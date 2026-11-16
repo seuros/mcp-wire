@@ -23,6 +23,11 @@ tokio = "1"
 tokio-stream = "0.1.19"
 url = "2"
 
+# mcp-host depends on mcp-wire from crates.io; resolve it to this workspace's
+# copy so host and guest share one set of wire types.
+[patch.crates-io]
+mcp-wire = { path = "crates/mcp-wire" }
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 unused_must_use = "warn"

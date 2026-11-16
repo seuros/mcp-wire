@@ -1416,9 +1416,9 @@ dependencies = [
 
 [[package]]
 name = "mcp-host"
-version = "0.23.1"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23f69abdea99ab6415c340b68cb4940d8eaaa180c9e7c73f9426949d48f7605e"
+checksum = "d5e48d4520fb23e97a169ec0586e45dfe5ba1a19bc0282a4386620398506c1ca"
 dependencies = [
  "arc-swap",
  "base64",
@@ -1431,6 +1431,7 @@ dependencies = [
  "ignore",
  "jiff",
  "mcp-host-macros",
+ "mcp-wire",
  "parking_lot",
  "rama",
  "schemars",

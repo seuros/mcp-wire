@@ -84,8 +84,6 @@ impl MessageTransport for HostTransport {
                     return Err(GuestError::Protocol("unexpected client response".into()));
                 }
             };
-            // The host speaks its own build of the wire types; JSON is the contract.
-            let request = serde_json::from_value(serde_json::to_value(&request)?)?;
             if let Some(response) = self.server.handle_request("guest", request).await {
                 let message = serde_json::from_slice(&serde_json::to_vec(&response)?)?;
                 self.responses

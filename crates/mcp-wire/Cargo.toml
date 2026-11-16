@@ -1,0 +1,26 @@
+[package]
+name = "mcp-wire"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Wire types of the Model Context Protocol, shared by MCP servers and clients"
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/mcp-wire"
+readme = "README.md"
+keywords = ["mcp", "protocol", "json-rpc", "llm"]
+categories = ["api-bindings", "encoding"]
+
+[dependencies]
+fluent-uri = "0.4"
+jiff.workspace = true
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+strum = { version = "0.28", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+
+[lints]
+workspace = true

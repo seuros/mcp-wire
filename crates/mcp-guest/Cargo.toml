@@ -1,0 +1,89 @@
+[package]
+name = "mcp-guest"
+version = "0.17.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "MCP client for connecting to Model Context Protocol servers"
+repository.workspace = true
+documentation = "https://docs.rs/mcp-guest"
+readme = "README.md"
+keywords = ["mcp", "client", "ai", "json-rpc"]
+categories = ["api-bindings", "asynchronous"]
+include = ["src/**", "Cargo.toml", "README.md"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = ["stdio"]
+stdio = []
+# Remote servers over streamable HTTP. HTTPS needs a TLS provider: pick one of
+# the `tls-*` features, or a provider the application already compiles into
+# rama (installed as rustls' process default).
+http = [
+    "dep:chrono-machines",
+    "dep:rand",
+    "dep:tokio-stream",
+    "dep:url",
+    "rama/http-backend",
+    "rama/tcp",
+    "rama/dns",
+]
+tls-ring = ["http", "rama/rustls", "rama/ring"]
+tls-aws-lc = ["http", "rama/rustls", "rama/aws-lc"]
+
+[dependencies]
+base64 = { workspace = true }
+chrono-machines = { workspace = true, optional = true }
+mcp-wire.workspace = true
+rand = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+state-machines = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "macros", "time", "io-util", "process", "net"] }
+thiserror = { workspace = true }
+# Minimal on purpose: every rama feature enabled here reaches every application
+# depending on this crate. Transports and TLS come in through the features above.
+rama = { version = "0.4", default-features = false, features = ["std"] }
+tokio-stream = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+
+[dev-dependencies]
+mcp-host = { version = "0.23", default-features = false, features = ["stdio", "macros"] }
+
+[lints.clippy]
+expect_used = "deny"
+identity_op = "deny"
+manual_clamp = "deny"
+manual_filter = "deny"
+manual_find = "deny"
+manual_flatten = "deny"
+manual_map = "deny"
+manual_memcpy = "deny"
+manual_non_exhaustive = "deny"
+manual_ok_or = "deny"
+manual_range_contains = "deny"
+manual_retain = "deny"
+manual_strip = "deny"
+manual_try_fold = "deny"
+manual_unwrap_or = "deny"
+needless_borrow = "deny"
+needless_borrowed_reference = "deny"
+needless_collect = "deny"
+needless_late_init = "deny"
+needless_option_as_deref = "deny"
+needless_question_mark = "deny"
+needless_update = "deny"
+redundant_clone = "deny"
+redundant_closure = "deny"
+redundant_closure_for_method_calls = "deny"
+redundant_static_lifetimes = "deny"
+trivially_copy_pass_by_ref = "deny"
+uninlined_format_args = "deny"
+unnecessary_filter_map = "deny"
+unnecessary_lazy_evaluations = "deny"
+unnecessary_sort_by = "deny"
+unnecessary_to_owned = "deny"
+unwrap_used = "deny"

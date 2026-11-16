@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  qa:
+    name: fmt, clippy, tests — ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          install_args: rust
+          cache: false
+      - run: rustup component add clippy rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just@1.46.0
+      - run: just qa
+
+  tls:
+    name: mcp-guest TLS ${{ matrix.backend }} — ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [ring, aws-lc]
+        os: [ubuntu-24.04, macos-26]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: seuros/setup-upkg@master
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          missing=()
+          command -v pkg-config >/dev/null || missing+=(pkg-config)
+          compgen -G '/usr/lib/llvm-*/lib/libclang.so' >/dev/null || missing+=(libclang-dev)
+          if [ "${#missing[@]}" -gt 0 ]; then
+            upkg install "${missing[@]}"
+          fi
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          upkg install llvm pkgconf
+          LLVM_PREFIX="$(brew --prefix llvm)"
+          echo "LIBCLANG_PATH=${LLVM_PREFIX}/lib" >> "$GITHUB_ENV"
+          echo "${LLVM_PREFIX}/bin" >> "$GITHUB_PATH"
+      - name: Install AWS-LC build dependency
+        if: matrix.backend == 'aws-lc'
+        run: command -v cmake >/dev/null || upkg install cmake
+      - uses: jdx/mise-action@v4
+        with:
+          install_args: rust
+          cache: false
+      - run: rustup component add clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: tls-${{ matrix.backend }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just@1.46.0
+      # Package-scoped so neither TLS provider unifies into the other's graph.
+      - run: just qa-tls "${{ matrix.backend }}"

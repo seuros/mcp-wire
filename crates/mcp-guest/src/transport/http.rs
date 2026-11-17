@@ -5,8 +5,6 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use chrono_machines::ExponentialBackoff;
-use chrono_machines::backoff::BackoffStrategy;
 use rama::Service;
 use rama::bytes::Bytes;
 use rama::error::extra::OpaqueError;
@@ -432,8 +430,12 @@ impl HttpTransportInner {
                         break;
                     }
 
-                    if let Some(stream) = self.lifecycle().stream() {
-                        stream.reconnect_attempt = 0;
+                    if let Some(reconnect) = self
+                        .lifecycle()
+                        .stream()
+                        .and_then(|stream| stream.reconnect.as_mut())
+                    {
+                        reconnect.succeeded();
                     }
                     if let Err(error) = self
                         .consume_sse_response(response, true, false, true, generation)
@@ -518,7 +520,7 @@ impl HttpTransportInner {
                         if let Some(retry) = event.retry()
                             && let Some(stream) = lifecycle.stream()
                         {
-                            stream.reconnect_delay = retry;
+                            stream.reconnect = lifecycle::reconnect_retry(retry);
                         }
                         if track_last_event_id && let Some(data) = lifecycle.data_mut() {
                             data.last_event_id = event.id().map(ToOwned::to_owned);
@@ -557,30 +559,22 @@ impl HttpTransportInner {
         let shutdown = self.shutdown_notify.notified();
         tokio::pin!(shutdown);
         shutdown.as_mut().enable();
-        let (attempt, base_delay) = {
+        let delay = {
             let mut lifecycle = self.lifecycle();
             if !lifecycle.sse(HttpSseEvent::Retry) {
                 return false;
             }
-            let Some(stream) = lifecycle.stream() else {
+            let Some(reconnect) = lifecycle
+                .stream()
+                .and_then(|stream| stream.reconnect.as_mut())
+            else {
                 return false;
             };
-            stream.reconnect_attempt = stream.reconnect_attempt.saturating_add(1);
-            (
-                stream.reconnect_attempt.min(u32::from(u8::MAX)) as u8,
-                stream.reconnect_delay,
-            )
+            let Ok(delay) = reconnect.failed(rand::random()) else {
+                return false;
+            };
+            delay
         };
-        let backoff = ExponentialBackoff::new()
-            .max_attempts(u8::MAX)
-            .base_delay_ms(base_delay.as_millis() as u64)
-            .multiplier(2.0)
-            .max_delay_ms(30_000);
-        let mut rng: rand::rngs::StdRng = rand::make_rng();
-        let delay_ms = backoff
-            .delay(attempt, &mut rng)
-            .unwrap_or(base_delay.as_millis() as u64);
-        let delay = Duration::from_millis(delay_ms);
         tokio::select! {
             _ = tokio::time::sleep(delay) => true,
             _ = shutdown => false,

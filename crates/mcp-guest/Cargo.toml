@@ -51,7 +51,7 @@ tokio-stream = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 
 [dev-dependencies]
-mcp-host = { version = "0.24", default-features = false, features = ["stdio", "macros"] }
+mcp-host = { version = "0.25", default-features = false, features = ["stdio", "macros"] }
 
 [lints.clippy]
 expect_used = "deny"

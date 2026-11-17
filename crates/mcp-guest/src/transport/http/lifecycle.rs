@@ -1,3 +1,5 @@
+use chrono_machines::Exponential;
+use chrono_machines::Retry;
 use state_machines::state_machine;
 use std::time::Duration;
 use tokio::task::{JoinHandle, JoinSet};
@@ -24,8 +26,14 @@ impl SessionData {
 #[derive(Debug)]
 pub(super) struct StreamData {
     pub task: Option<JoinHandle<()>>,
-    pub reconnect_delay: Duration,
-    pub reconnect_attempt: u32,
+    pub reconnect: Option<Retry>,
+}
+
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
+
+pub(super) fn reconnect_retry(base: Duration) -> Option<Retry> {
+    Exponential::new(base.min(RECONNECT_MAX_DELAY), 2.0, RECONNECT_MAX_DELAY, 1.0)
+        .map(|shape| Retry::new(shape.into(), None))
 }
 
 impl Drop for StreamData {
@@ -146,8 +154,7 @@ impl Lifecycle {
             sse: sse::HttpSse::new(())
                 .with_enabled_data(StreamData {
                     task: None,
-                    reconnect_delay,
-                    reconnect_attempt: 0,
+                    reconnect: reconnect_retry(reconnect_delay),
                 })
                 .into_dynamic(),
         }

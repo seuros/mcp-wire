@@ -41,6 +41,13 @@ const HEADER_LAST_EVENT_ID: &str = "Last-Event-ID";
 
 type HttpClient = BoxService<Request, Response, OpaqueError>;
 
+#[derive(Debug, Default)]
+struct StreamCursor {
+    last_event_id: Option<String>,
+    retry: Option<Duration>,
+    answered: bool,
+}
+
 mod lifecycle;
 use lifecycle::{HttpSessionEvent, HttpSseEvent, Lifecycle};
 
@@ -71,6 +78,7 @@ struct HttpTransportInner {
     client: HttpClient,
     endpoint: Url,
     open_sse_stream: bool,
+    reconnect_delay: Duration,
     recovery_lock: Mutex<()>,
     default_headers: Vec<(String, String)>,
     inbound_tx: mpsc::Sender<JsonRpcMessage>,
@@ -94,6 +102,7 @@ impl HttpTransport {
                 client,
                 endpoint: config.endpoint,
                 open_sse_stream: config.open_sse_stream,
+                reconnect_delay: config.reconnect_delay,
                 recovery_lock: Mutex::new(()),
                 default_headers: config.default_headers,
                 inbound_tx,
@@ -291,18 +300,8 @@ impl HttpTransportInner {
             let data = lifecycle.data_mut().ok_or(GuestError::Disconnected)?;
             while data.streams.try_join_next().is_some() {}
             data.streams.spawn(async move {
-                if let Err(error) = this
-                    .consume_sse_response(
-                        response,
-                        false,
-                        initialize_request,
-                        deliver_inbound,
-                        generation,
-                    )
-                    .await
-                {
-                    tracing::warn!(error = %error, "post sse stream failed");
-                }
+                this.follow_post_stream(response, initialize_request, deliver_inbound, generation)
+                    .await;
             });
             Ok(())
         } else {
@@ -392,7 +391,7 @@ impl HttpTransportInner {
             }
 
             let generation = self.session_generation.load(Ordering::Acquire);
-            let request = match self.build_get_request().await {
+            let request = match self.build_get_request(None).await {
                 Ok(request) => request,
                 Err(error) => {
                     tracing::debug!(error = %error, "sse stream unavailable");
@@ -437,8 +436,9 @@ impl HttpTransportInner {
                     {
                         reconnect.succeeded();
                     }
+                    let mut cursor = StreamCursor::default();
                     if let Err(error) = self
-                        .consume_sse_response(response, true, false, true, generation)
+                        .consume_sse_response(response, &mut cursor, true, false, true, generation)
                         .await
                     {
                         tracing::warn!(error = %error, "sse stream ended with error");
@@ -468,7 +468,7 @@ impl HttpTransportInner {
         }
     }
 
-    async fn build_get_request(&self) -> Result<Request, GuestError> {
+    async fn build_get_request(&self, resume: Option<&str>) -> Result<Request, GuestError> {
         let lifecycle = self.lifecycle();
         let data = lifecycle.data().ok_or(GuestError::Disconnected)?;
         let session_id = data
@@ -485,7 +485,7 @@ impl HttpTransportInner {
             builder = builder.header(HEADER_PROTOCOL_VERSION, version);
         }
 
-        if let Some(last_event_id) = &data.last_event_id {
+        if let Some(last_event_id) = resume.or(data.last_event_id.as_deref()) {
             builder = builder.header(HEADER_LAST_EVENT_ID, last_event_id);
         }
 
@@ -502,9 +502,102 @@ impl HttpTransportInner {
         builder.body(Body::empty()).map_err(http_error)
     }
 
+    /// Read a POST's SSE stream to its response. A connection that drops
+    /// before the response arrived is resumed with a GET naming the stream's
+    /// last event, as often as it drops (2025-11-25 transports, resumability).
+    async fn follow_post_stream(
+        self: Arc<Self>,
+        mut response: Response,
+        initialize_request: bool,
+        deliver_inbound: bool,
+        generation: u64,
+    ) {
+        let mut cursor = StreamCursor::default();
+        let Some(mut backoff) = lifecycle::resume_retry(self.reconnect_delay) else {
+            return;
+        };
+        loop {
+            if let Err(error) = self
+                .consume_sse_response(
+                    response,
+                    &mut cursor,
+                    false,
+                    initialize_request,
+                    deliver_inbound,
+                    generation,
+                )
+                .await
+            {
+                tracing::warn!(error = %error, "post sse stream failed");
+            }
+            if cursor.answered {
+                return;
+            }
+            let Some(last_event_id) = cursor.last_event_id.clone() else {
+                return;
+            };
+            let Some(resumed) = self
+                .resume_stream(&last_event_id, &mut cursor, &mut backoff, generation)
+                .await
+            else {
+                return;
+            };
+            response = resumed;
+        }
+    }
+
+    /// Reconnect the stream `last_event_id` belongs to, waiting first the
+    /// `retry` it asked for, else a backoff. `None` once the session moved
+    /// on, the transport closed, the server refused, or the backoff ran out.
+    async fn resume_stream(
+        &self,
+        last_event_id: &str,
+        cursor: &mut StreamCursor,
+        backoff: &mut chrono_machines::Retry,
+        generation: u64,
+    ) -> Option<Response> {
+        loop {
+            let delay = match cursor.retry.take() {
+                Some(retry) => backoff.hinted(retry),
+                None => backoff.failed(rand::random()),
+            }
+            .ok()?;
+            let shutdown = self.shutdown_notify.notified();
+            tokio::pin!(shutdown);
+            shutdown.as_mut().enable();
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = shutdown => return None,
+            }
+            if self.closed.load(Ordering::Acquire)
+                || self.session_generation.load(Ordering::Acquire) != generation
+            {
+                return None;
+            }
+            let request = self.build_get_request(Some(last_event_id)).await.ok()?;
+            let response = match self.client.serve(request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!(error = %error, "post sse resume failed");
+                    continue;
+                }
+            };
+            let status = response.status();
+            if status == StatusCode::OK {
+                backoff.succeeded();
+                return Some(response);
+            }
+            tracing::warn!(status = %status, "post sse resume rejected");
+            if status != StatusCode::TOO_MANY_REQUESTS && !status.is_server_error() {
+                return None;
+            }
+        }
+    }
+
     async fn consume_sse_response(
         self: &Arc<Self>,
         response: Response,
+        cursor: &mut StreamCursor,
         track_last_event_id: bool,
         initialize_request_context: bool,
         deliver_inbound: bool,
@@ -514,6 +607,14 @@ impl HttpTransportInner {
 
         while let Some(event) = stream.next().await {
             let event = event.map_err(|error| GuestError::Http(describe_error(&*error)))?;
+            // An event without an id, a keep-alive or a bare `retry`, leaves
+            // the last event id as it was (WHATWG SSE, dispatch).
+            if let Some(id) = event.id() {
+                cursor.last_event_id = Some(id.to_owned());
+            }
+            if let Some(retry) = event.retry() {
+                cursor.retry = Some(retry);
+            }
             {
                 match self.current_lifecycle(generation) {
                     Ok(mut lifecycle) => {
@@ -522,8 +623,11 @@ impl HttpTransportInner {
                         {
                             stream.reconnect = lifecycle::reconnect_retry(retry);
                         }
-                        if track_last_event_id && let Some(data) = lifecycle.data_mut() {
-                            data.last_event_id = event.id().map(ToOwned::to_owned);
+                        if track_last_event_id
+                            && let Some(id) = event.id()
+                            && let Some(data) = lifecycle.data_mut()
+                        {
+                            data.last_event_id = Some(id.to_owned());
                         }
                     }
                     Err(GuestError::SessionExpired)
@@ -538,6 +642,7 @@ impl HttpTransportInner {
                 continue;
             }
             let message: JsonRpcMessage = serde_json::from_str(&data)?;
+            cursor.answered |= matches!(message, JsonRpcMessage::Response(_));
             self.inspect_inbound_message(&message, initialize_request_context, generation)
                 .await?;
             if deliver_inbound {

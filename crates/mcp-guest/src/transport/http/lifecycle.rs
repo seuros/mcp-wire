@@ -1,6 +1,7 @@
 use chrono_machines::Exponential;
 use chrono_machines::Retry;
 use state_machines::state_machine;
+use std::num::NonZeroU8;
 use std::time::Duration;
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -34,6 +35,15 @@ const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 pub(super) fn reconnect_retry(base: Duration) -> Option<Retry> {
     Exponential::new(base.min(RECONNECT_MAX_DELAY), 2.0, RECONNECT_MAX_DELAY, 1.0)
         .map(|shape| Retry::new(shape.into(), None))
+}
+
+/// Consecutive failed attempts to resume a POST stream before its response
+/// is given up on; the request's own timeout fails its caller.
+const RESUME_ATTEMPTS: NonZeroU8 = NonZeroU8::new(5).unwrap();
+
+pub(super) fn resume_retry(base: Duration) -> Option<Retry> {
+    Exponential::new(base.min(RECONNECT_MAX_DELAY), 2.0, RECONNECT_MAX_DELAY, 1.0)
+        .map(|shape| Retry::new(shape.into(), Some(RESUME_ATTEMPTS)))
 }
 
 impl Drop for StreamData {

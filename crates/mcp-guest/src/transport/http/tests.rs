@@ -706,7 +706,7 @@ async fn transport_applies_custom_headers_and_merges_accept() {
         data.last_event_id = Some("event-42".to_string());
     }
 
-    let get_request = transport.inner.build_get_request().await.unwrap();
+    let get_request = transport.inner.build_get_request(None).await.unwrap();
     assert_eq!(
         get_request.headers()["authorization"].to_str().unwrap(),
         "Bearer secret"
@@ -731,4 +731,156 @@ async fn transport_applies_custom_headers_and_merges_accept() {
     let get_accept = get_request.headers()[ACCEPT].to_str().unwrap();
     assert!(get_accept.contains(MIME_TEXT_EVENT_STREAM));
     assert!(get_accept.contains("application/vnd.example+json"));
+}
+
+fn sse_response(body: &'static str) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, MIME_TEXT_EVENT_STREAM)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+fn accepted() -> Response {
+    Response::builder()
+        .status(StatusCode::ACCEPTED)
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn last_event_id(req: &Request) -> Option<String> {
+    req.headers()
+        .get(HEADER_LAST_EVENT_ID)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
+}
+
+fn test_transport(open_sse_stream: bool, client: HttpClient) -> Arc<HttpTransport> {
+    HttpTransport::with_client(
+        HttpClientConfig {
+            endpoint: Url::parse("http://localhost:62770/mcp").unwrap(),
+            open_sse_stream,
+            reconnect_delay: Duration::from_millis(5),
+            default_headers: Vec::new(),
+        },
+        client,
+    )
+}
+
+async fn recv_soon(transport: &HttpTransport) -> JsonRpcMessage {
+    tokio::time::timeout(Duration::from_secs(2), transport.recv())
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn get_stream_resumes_from_its_last_event_id_past_keep_alives() {
+    let resumed_from = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let client = {
+        let resumed_from = Arc::clone(&resumed_from);
+        service_fn(move |req: Request| {
+            let resumed_from = Arc::clone(&resumed_from);
+            async move {
+                let response = match req.method().as_str() {
+                    "POST" => match record_request(req).await.rpc_method.as_deref() {
+                        Some("initialize") => initialize_http_response("session-123"),
+                        _ => accepted(),
+                    },
+                    _ => {
+                        let gets = {
+                            let mut seen = resumed_from.lock().unwrap();
+                            seen.push(last_event_id(&req));
+                            seen.len()
+                        };
+                        match gets {
+                            1 => sse_response(
+                                "id: s:g:1\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\
+                                 \"method\":\"notifications/tools/list_changed\"}\n\n:\n\n\
+                                 retry: 5\n\n",
+                            ),
+                            2 => sse_response(
+                                "id: s:g:2\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\
+                                 \"method\":\"notifications/prompts/list_changed\"}\n\n",
+                            ),
+                            _ => Response::builder()
+                                .status(StatusCode::METHOD_NOT_ALLOWED)
+                                .body(Body::empty())
+                                .unwrap(),
+                        }
+                    }
+                };
+                Ok::<_, OpaqueError>(response)
+            }
+        })
+        .boxed()
+    };
+    let transport = test_transport(true, client);
+    send_initialize(&transport).await;
+    recv_soon(&transport).await;
+    transport
+        .send(JsonRpcMessage::Notification(JsonRpcRequest::notification(
+            "notifications/initialized",
+            None,
+        )))
+        .await
+        .unwrap();
+
+    recv_soon(&transport).await;
+    let JsonRpcMessage::Notification(resumed) = recv_soon(&transport).await else {
+        panic!("expected the resumed stream's notification");
+    };
+    assert_eq!(resumed.method, "notifications/prompts/list_changed");
+    assert_eq!(
+        resumed_from.lock().unwrap()[..2],
+        [None, Some("s:g:1".to_owned())]
+    );
+    transport.force_shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn post_stream_dropped_before_its_response_resumes_with_get() {
+    let resumed_from = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let client = {
+        let resumed_from = Arc::clone(&resumed_from);
+        service_fn(move |req: Request| {
+            let resumed_from = Arc::clone(&resumed_from);
+            async move {
+                let response = match req.method().as_str() {
+                    "POST" => match record_request(req).await.rpc_method.as_deref() {
+                        Some("initialize") => initialize_http_response("session-123"),
+                        Some("tools/call") => sse_response("id: s:p:1\ndata: \n\nretry: 5\n\n"),
+                        _ => accepted(),
+                    },
+                    _ => {
+                        resumed_from.lock().unwrap().push(last_event_id(&req));
+                        sse_response(
+                            "id: s:p:2\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":7,\
+                             \"result\":{\"content\":[]}}\n\n",
+                        )
+                    }
+                };
+                Ok::<_, OpaqueError>(response)
+            }
+        })
+        .boxed()
+    };
+    let transport = test_transport(false, client);
+    send_initialize(&transport).await;
+    recv_soon(&transport).await;
+    transport
+        .send(JsonRpcMessage::Request(JsonRpcRequest::new(
+            json!(7),
+            "tools/call",
+            Some(json!({ "name": "slow", "arguments": {} })),
+        )))
+        .await
+        .unwrap();
+
+    let JsonRpcMessage::Response(response) = recv_soon(&transport).await else {
+        panic!("expected the tool call's response");
+    };
+    assert_eq!(response.id, Some(json!(7)));
+    assert_eq!(*resumed_from.lock().unwrap(), [Some("s:p:1".to_owned())]);
+    transport.force_shutdown().await.unwrap();
 }

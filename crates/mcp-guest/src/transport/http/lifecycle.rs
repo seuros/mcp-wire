@@ -28,6 +28,8 @@ impl SessionData {
 pub(super) struct StreamData {
     pub task: Option<JoinHandle<()>>,
     pub reconnect: Option<Retry>,
+    /// The `retry` the server last sent on the standalone stream.
+    pub retry: Option<Duration>,
 }
 
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
@@ -165,6 +167,7 @@ impl Lifecycle {
                 .with_enabled_data(StreamData {
                     task: None,
                     reconnect: reconnect_retry(reconnect_delay),
+                    retry: None,
                 })
                 .into_dynamic(),
         }

@@ -546,8 +546,8 @@ impl HttpTransportInner {
         }
     }
 
-    /// Reconnect the stream `last_event_id` belongs to, waiting first the
-    /// `retry` it asked for, else a backoff. `None` once the session moved
+    /// Reconnect the stream `last_event_id` belongs to, after a backoff no
+    /// shorter than the `retry` it asked for. `None` once the session moved
     /// on, the transport closed, the server refused, or the backoff ran out.
     async fn resume_stream(
         &self,
@@ -557,11 +557,7 @@ impl HttpTransportInner {
         generation: u64,
     ) -> Option<Response> {
         loop {
-            let delay = match cursor.retry.take() {
-                Some(retry) => backoff.hinted(retry),
-                None => backoff.failed(rand::random()),
-            }
-            .ok()?;
+            let delay = at_least_retry(backoff.failed(rand::random()).ok()?, cursor.retry);
             let shutdown = self.shutdown_notify.notified();
             tokio::pin!(shutdown);
             shutdown.as_mut().enable();
@@ -621,7 +617,7 @@ impl HttpTransportInner {
                         if let Some(retry) = event.retry()
                             && let Some(stream) = lifecycle.stream()
                         {
-                            stream.reconnect = lifecycle::reconnect_retry(retry);
+                            stream.retry = Some(retry);
                         }
                         if track_last_event_id
                             && let Some(id) = event.id()
@@ -669,16 +665,17 @@ impl HttpTransportInner {
             if !lifecycle.sse(HttpSseEvent::Retry) {
                 return false;
             }
-            let Some(reconnect) = lifecycle
-                .stream()
-                .and_then(|stream| stream.reconnect.as_mut())
+            let Some(stream) = lifecycle.stream() else {
+                return false;
+            };
+            let Some(Ok(delay)) = stream
+                .reconnect
+                .as_mut()
+                .map(|reconnect| reconnect.failed(rand::random()))
             else {
                 return false;
             };
-            let Ok(delay) = reconnect.failed(rand::random()) else {
-                return false;
-            };
-            delay
+            at_least_retry(delay, stream.retry)
         };
         tokio::select! {
             _ = tokio::time::sleep(delay) => true,
@@ -967,6 +964,12 @@ impl MessageTransport for HttpTransport {
         let inner = Arc::clone(&self.inner);
         Box::pin(async move { inner.force_shutdown_inner().await })
     }
+}
+
+/// A jittered backoff never undercuts the stream's `retry`, which the client
+/// MUST wait (2025-11-25 transports).
+fn at_least_retry(backoff: Duration, retry: Option<Duration>) -> Duration {
+    retry.map_or(backoff, |retry| backoff.max(retry))
 }
 
 fn is_initialize_request(message: &JsonRpcMessage) -> bool {

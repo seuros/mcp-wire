@@ -884,3 +884,60 @@ async fn post_stream_dropped_before_its_response_resumes_with_get() {
     assert_eq!(*resumed_from.lock().unwrap(), [Some("s:p:1".to_owned())]);
     transport.force_shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn get_reconnect_waits_at_least_the_server_retry() {
+    let opened = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let client = {
+        let opened = Arc::clone(&opened);
+        service_fn(move |req: Request| {
+            let opened = Arc::clone(&opened);
+            async move {
+                let response = match req.method().as_str() {
+                    "POST" => match record_request(req).await.rpc_method.as_deref() {
+                        Some("initialize") => initialize_http_response("session-123"),
+                        _ => accepted(),
+                    },
+                    _ => {
+                        let gets = {
+                            let mut opened = opened.lock().unwrap();
+                            opened.push(tokio::time::Instant::now());
+                            opened.len()
+                        };
+                        if gets == 1 {
+                            sse_response("id: s:g:1\ndata: \n\nretry: 300\n\n")
+                        } else {
+                            Response::builder()
+                                .status(StatusCode::METHOD_NOT_ALLOWED)
+                                .body(Body::empty())
+                                .unwrap()
+                        }
+                    }
+                };
+                Ok::<_, OpaqueError>(response)
+            }
+        })
+        .boxed()
+    };
+    let transport = test_transport(true, client);
+    send_initialize(&transport).await;
+    recv_soon(&transport).await;
+    transport
+        .send(JsonRpcMessage::Notification(JsonRpcRequest::notification(
+            "notifications/initialized",
+            None,
+        )))
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while opened.lock().unwrap().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let opened = opened.lock().unwrap().clone();
+    assert!(opened[1] - opened[0] >= Duration::from_millis(300));
+    transport.force_shutdown().await.unwrap();
+}
